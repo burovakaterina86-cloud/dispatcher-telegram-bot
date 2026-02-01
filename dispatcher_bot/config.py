@@ -7,7 +7,7 @@ import sys
 
 
 # Таймауты (секунды)
-CLAUDE_TIMEOUT = 25
+OPENAI_TIMEOUT = 25
 MAKE_TIMEOUT = 25
 MAKE_RETRIES = 2
 
@@ -15,9 +15,15 @@ MAKE_RETRIES = 2
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 MAKE_WEBHOOK_URL = os.environ.get("MAKE_WEBHOOK_URL")
 
-# Опциональные переменные (без них классификатор работает в fallback режиме)
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL")
+# OpenAI (опционально, без них классификатор работает в fallback режиме)
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+
+# Опциональный chat_id админа для алертов
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
+
+# Опциональный webhook для обновления статусов лидов
+MAKE_STATUS_WEBHOOK_URL = os.environ.get("MAKE_STATUS_WEBHOOK_URL")
 
 
 def validate_config() -> None:
@@ -34,6 +40,8 @@ def validate_config() -> None:
         print(f"[ERROR] Отсутствуют обязательные переменные окружения: {', '.join(missing)}")
         sys.exit(1)
 
-    # Если есть API ключ, должна быть и модель
-    if ANTHROPIC_API_KEY and not CLAUDE_MODEL:
-        print("[WARNING] ANTHROPIC_API_KEY задан, но CLAUDE_MODEL не указан. Классификация будет в fallback режиме.")
+    if not OPENAI_API_KEY:
+        print("[WARNING] OPENAI_API_KEY не задан. Классификация будет в fallback режиме.")
+
+    if not MAKE_STATUS_WEBHOOK_URL:
+        print("[WARNING] MAKE_STATUS_WEBHOOK_URL не задан. Обновление статусов в Make недоступно.")

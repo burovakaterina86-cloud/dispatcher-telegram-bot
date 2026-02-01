@@ -1,12 +1,12 @@
 """
-Классификация сообщений через Claude API.
+Классификация сообщений через OpenAI API.
 """
 
 import json
 import re
 from typing import Any
 
-from config import ANTHROPIC_API_KEY, CLAUDE_MODEL, CLAUDE_TIMEOUT
+from config import OPENAI_API_KEY, OPENAI_MODEL, OPENAI_TIMEOUT
 
 
 SYSTEM_PROMPT = """Ты диспетчер входящих обращений студии.
@@ -27,15 +27,29 @@ SYSTEM_PROMPT = """Ты диспетчер входящих обращений �
 - consultation — консультация (разбор, стратегия, аудит, созвон/чат)
 - unknown — не удалось определить
 
-JSON схема:
-{"intent": "lead", "service": "make_automation", "confidence": 0.85, "summary": "краткое резюме на русском"}"""
+Дополнительные поля (fields):
+- budget — бюджет в рублях (число или null). "50k" = 50000, "50-60к" = 50000 (нижняя граница)
+- deadline_text — срок как написал клиент ("к пятнице", "до 10 февраля") или null
+- contact — телефон/email/ник если есть, или null
+- goal — кратко что хочет клиент ("бот для записи клиентов") или null
 
+JSON схема:
+{"intent": "lead", "service": "make_automation", "confidence": 0.85, "summary": "краткое резюме на русском", "fields": {"budget": 50000, "deadline_text": "к пятнице", "contact": null, "goal": "бот для записи"}}"""
+
+
+FALLBACK_FIELDS = {
+    "budget": None,
+    "deadline_text": None,
+    "contact": None,
+    "goal": None
+}
 
 FALLBACK_RESULT = {
     "intent": "other",
     "service": "unknown",
     "confidence": 0.0,
-    "summary": "Не удалось классифицировать"
+    "summary": "Не удалось классифицировать",
+    "fields": FALLBACK_FIELDS.copy()
 }
 
 VALID_INTENTS = {"lead", "question", "support", "other"}
@@ -58,12 +72,58 @@ def _extract_json(text: str) -> dict[str, Any] | None:
         except json.JSONDecodeError:
             pass
 
-    # Пробуем найти просто JSON объект в тексте
-    json_match = re.search(r"\{[^{}]*\}", text)
-    if json_match:
+    # Пробуем найти JSON объект в тексте (с вложенными объектами)
+    brace_count = 0
+    start_idx = -1
+    for i, char in enumerate(text):
+        if char == '{':
+            if brace_count == 0:
+                start_idx = i
+            brace_count += 1
+        elif char == '}':
+            brace_count -= 1
+            if brace_count == 0 and start_idx != -1:
+                try:
+                    return json.loads(text[start_idx:i + 1])
+                except json.JSONDecodeError:
+                    start_idx = -1
+
+    return None
+
+
+def _parse_budget(value: Any) -> int | None:
+    """Парсит бюджет в число рублей."""
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)):
+        return int(value)
+
+    if isinstance(value, str):
+        # Убираем пробелы и приводим к нижнему регистру
+        s = value.lower().replace(" ", "").replace(",", ".")
+
+        # "50k", "50к" -> 50000
+        if s.endswith("k") or s.endswith("к"):
+            try:
+                return int(float(s[:-1]) * 1000)
+            except ValueError:
+                pass
+
+        # Диапазон "40-60" или "40-60k" -> берём нижнюю границу
+        range_match = re.match(r"(\d+(?:\.\d+)?)\s*[-–—]\s*(\d+(?:\.\d+)?)\s*([kк])?", s)
+        if range_match:
+            try:
+                lower = float(range_match.group(1))
+                multiplier = 1000 if range_match.group(3) else 1
+                return int(lower * multiplier)
+            except ValueError:
+                pass
+
+        # Простое число
         try:
-            return json.loads(json_match.group(0))
-        except json.JSONDecodeError:
+            return int(float(s))
+        except ValueError:
             pass
 
     return None
@@ -92,37 +152,47 @@ def _validate_result(data: dict[str, Any]) -> dict[str, Any]:
     summary = data.get("summary", "")
     result["summary"] = str(summary) if summary else "Нет описания"
 
+    # fields
+    raw_fields = data.get("fields", {}) or {}
+    fields = {
+        "budget": _parse_budget(raw_fields.get("budget")),
+        "deadline_text": raw_fields.get("deadline_text") if isinstance(raw_fields.get("deadline_text"), str) else None,
+        "contact": raw_fields.get("contact") if isinstance(raw_fields.get("contact"), str) else None,
+        "goal": raw_fields.get("goal") if isinstance(raw_fields.get("goal"), str) else None,
+    }
+    result["fields"] = fields
+
     return result
 
 
 def classify(text: str) -> dict[str, Any]:
     """
-    Классифицирует текст сообщения через Claude API.
+    Классифицирует текст сообщения через OpenAI API.
 
     Returns:
-        dict с ключами: intent, service, confidence, summary
+        dict с ключами: intent, service, confidence, summary, fields
     """
-    # Если нет API ключа или модели — сразу fallback
-    if not ANTHROPIC_API_KEY or not CLAUDE_MODEL:
+    # Если нет API ключа — сразу fallback
+    if not OPENAI_API_KEY:
         return FALLBACK_RESULT.copy()
 
     try:
-        import anthropic
+        from openai import OpenAI
 
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        client = OpenAI(api_key=OPENAI_API_KEY)
 
-        message = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=256,
-            timeout=CLAUDE_TIMEOUT,
-            system=SYSTEM_PROMPT,
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            max_tokens=512,
+            timeout=OPENAI_TIMEOUT,
             messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": text}
             ]
         )
 
         # Извлекаем текст ответа
-        response_text = message.content[0].text if message.content else ""
+        response_text = response.choices[0].message.content if response.choices else ""
 
         # Парсим JSON
         parsed = _extract_json(response_text)

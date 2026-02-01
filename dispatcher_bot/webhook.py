@@ -7,7 +7,7 @@ from typing import Any
 
 import requests
 
-from config import MAKE_WEBHOOK_URL, MAKE_TIMEOUT, MAKE_RETRIES
+from config import MAKE_WEBHOOK_URL, MAKE_STATUS_WEBHOOK_URL, MAKE_TIMEOUT, MAKE_RETRIES
 
 
 class WebhookError(Exception):
@@ -15,11 +15,12 @@ class WebhookError(Exception):
     pass
 
 
-def send_to_make(payload: dict[str, Any]) -> None:
+def _send_with_retries(url: str, payload: dict[str, Any]) -> None:
     """
-    Отправляет JSON payload в Make webhook.
+    Отправляет JSON payload в webhook с ретраями.
 
     Args:
+        url: URL webhook
         payload: Данные для отправки
 
     Raises:
@@ -31,9 +32,9 @@ def send_to_make(payload: dict[str, Any]) -> None:
     for attempt in range(MAKE_RETRIES + 1):
         try:
             response = requests.post(
-                MAKE_WEBHOOK_URL,
+                url,
                 json=payload,
-                timeout=MAKE_TIMEOUT,
+                timeout=MAKE_TIMEOUT,  # 25 секунд из config
                 headers={"Content-Type": "application/json"}
             )
 
@@ -62,4 +63,34 @@ def send_to_make(payload: dict[str, Any]) -> None:
             time.sleep(delays[attempt])
 
     # Все попытки исчерпаны
-    raise WebhookError(f"Make webhook failed after {MAKE_RETRIES + 1} attempts: {last_error}")
+    raise WebhookError(f"Webhook failed after {MAKE_RETRIES + 1} attempts: {last_error}")
+
+
+def send_to_make(payload: dict[str, Any]) -> None:
+    """
+    Отправляет JSON payload в основной Make webhook.
+
+    Args:
+        payload: Данные для отправки
+
+    Raises:
+        WebhookError: При ошибке после всех попыток
+    """
+    _send_with_retries(MAKE_WEBHOOK_URL, payload)
+
+
+def send_status_update_to_make(payload: dict[str, Any]) -> None:
+    """
+    Отправляет обновление статуса в Make webhook.
+
+    Args:
+        payload: Данные для отправки (action, trace_id, status, changed_at)
+
+    Raises:
+        WebhookError: При ошибке после всех попыток
+        ValueError: Если MAKE_STATUS_WEBHOOK_URL не настроен
+    """
+    if not MAKE_STATUS_WEBHOOK_URL:
+        raise ValueError("MAKE_STATUS_WEBHOOK_URL не настроен")
+
+    _send_with_retries(MAKE_STATUS_WEBHOOK_URL, payload)
