@@ -36,7 +36,9 @@ class TraceFormatter(logging.Formatter):
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+# Используем UTF-8 для корректного вывода эмодзи в Windows
 handler = logging.StreamHandler(sys.stdout)
+handler.stream = open(sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1)
 handler.setFormatter(TraceFormatter())
 logger.addHandler(handler)
 
@@ -44,13 +46,16 @@ logger.addHandler(handler)
 # ==================== КОНСТАНТЫ ====================
 
 # Статусы лидов (для админа)
+# Коды статусов (ASCII, для callback_data)
 LEAD_STATUSES = ["new", "in_progress", "booked", "closed", "spam"]
+
+# Русские подписи для inline-кнопок и отображения
 STATUS_LABELS = {
-    "new": "new",
-    "in_progress": "in_progress",
-    "booked": "booked",
-    "closed": "closed",
-    "spam": "spam"
+    "new": "🆕 новая заявка",
+    "in_progress": "🛠 в работе",
+    "booked": "📅 созвон назначен",
+    "closed": "✅ закрыто",
+    "spam": "🚫 спам"
 }
 
 # Тексты кнопок ReplyKeyboard (для пользователя)
@@ -72,26 +77,61 @@ START_MESSAGE = """Привет! Я диспетчер входящих Буро
 Напиши одним сообщением: что нужно + бюджет (если есть) + срок (если есть) + контакт.
 
 Примеры:
-— Лид: Нужен бот записи, бюджет 50к, срок до пятницы, @username
-— Поддержка: Бот не отвечает, ошибка при оплате, прикрепляю скрин, @username
-— Консультация: Хочу консультацию по Make на этой неделе, 1 час, @username"""
+— Нужен бот записи, бюджет 50к, срок до пятницы, @username
+— Бот не отвечает, ошибка при оплате, прикрепляю скрин, @username
+— Хочу консультацию по Make на этой неделе, 1 час, @username"""
 
 NEW_REQUEST_MESSAGE = """Ок 🙂 Напиши одним сообщением:
-— тип: лид / вопрос / поддержка / консультация
 — что нужно
 — бюджет (если есть)
 — срок (если есть)
 — контакт
 
-Пример: лид — нужен бот записи, бюджет 50к, срок до пятницы, @username"""
+Пример: Нужен бот записи, бюджет 50к, срок до пятницы, @username"""
 
 HELP_MESSAGE = """Шаблон:
-тип — что нужно — бюджет — срок — контакт
+что нужно — бюджет — срок — контакт
 
-Пример: вопрос — сколько стоит бот записи и какие сроки? @username"""
+Пример: Сколько стоит бот записи и какие сроки? @username"""
 
 
 # ==================== УТИЛИТЫ ====================
+
+def build_payload(
+    trace_id: str,
+    created_at: str,
+    chat_id: int,
+    message_id: int,
+    user_info: dict,
+    text: str,
+    classification: dict
+) -> dict:
+    """
+    Собирает payload для MAKE_WEBHOOK_URL.
+    Гарантирует наличие ключа 'goal' (даже если пустая строка).
+    """
+    # Извлекаем goal из fields и нормализуем
+    fields = classification.get("fields", {}) or {}
+    goal = (fields.get("goal") or "").strip()
+
+    return {
+        "trace_id": trace_id,
+        "created_at": created_at,
+        "source": "telegram",
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "user": user_info,
+        "text": text,
+        "intent": classification.get("intent", "other"),
+        "service": classification.get("service", "unknown"),
+        "confidence": classification.get("confidence", 0.0),
+        "summary": classification.get("summary", ""),
+        "goal": goal,  # Всегда присутствует, даже если пустая строка
+        "budget": fields.get("budget"),
+        "deadline_text": fields.get("deadline_text"),
+        "contact": fields.get("contact"),
+    }
+
 
 def log_with_trace(level: int, trace_id: str, message: str) -> None:
     """Логирует сообщение с trace_id."""
@@ -230,19 +270,22 @@ async def handle_status_callback(update: Update, context: ContextTypes.DEFAULT_T
     if not query or not query.data:
         return
 
-    # Парсим callback_data: "status|<trace_id>|<status>"
+    # Парсим callback_data: "status|<trace_id>|<status_code>"
     parts = query.data.split("|")
     if len(parts) != 3 or parts[0] != "status":
         await query.answer("Неверный формат данных")
         return
 
-    _, trace_id, status = parts
+    _, trace_id, status_code = parts
 
-    if status not in LEAD_STATUSES:
+    if status_code not in LEAD_STATUSES:
         await query.answer("Неизвестный статус")
         return
 
-    log_with_trace(logging.INFO, trace_id, f"Status button pressed: {status}")
+    # Получаем русский статус с эмодзи
+    status_ru = STATUS_LABELS.get(status_code, status_code)
+
+    log_with_trace(logging.INFO, trace_id, f"Status button pressed: {status_code}")
 
     # Проверяем настроен ли webhook
     if not MAKE_STATUS_WEBHOOK_URL:
@@ -255,21 +298,22 @@ async def handle_status_callback(update: Update, context: ContextTypes.DEFAULT_T
     payload = {
         "action": "status_update",
         "trace_id": trace_id,
-        "status": status,
+        "status": status_ru,           # Русский статус с эмодзи (для таблицы)
+        "status_code": status_code,    # ASCII код (для отладки)
         "changed_at": changed_at
     }
 
     # Отправляем в Make
     try:
         send_status_update_to_make(payload)
-        log_with_trace(logging.INFO, trace_id, f"Status update sent: {status}")
+        log_with_trace(logging.INFO, trace_id, f"Status update sent: {status_code} -> {status_ru}")
 
         # Успех — отвечаем на callback и редактируем сообщение
-        await query.answer(f"Статус обновлён: {status}")
+        await query.answer(f"Статус: {status_ru}")
 
-        # Редактируем сообщение, добавляя статус
+        # Редактируем сообщение, добавляя русский статус
         original_text = query.message.text if query.message else ""
-        new_text = f"[Статус: {status}]\n\n{original_text}"
+        new_text = f"[Статус: {status_ru}]\n\n{original_text}"
 
         await query.edit_message_text(
             text=new_text,
@@ -288,7 +332,7 @@ async def handle_status_callback(update: Update, context: ContextTypes.DEFAULT_T
                 admin_id = int(ADMIN_CHAT_ID)
                 await context.bot.send_message(
                     chat_id=admin_id,
-                    text=f"Ошибка обновления статуса\ntrace_id: {trace_id}\nstatus: {status}\nerror: {error_msg[:100]}"
+                    text=f"Ошибка обновления статуса\ntrace_id: {trace_id}\nstatus: {status_ru}\nerror: {error_msg[:100]}"
                 )
             except Exception:
                 pass
@@ -362,20 +406,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "name": user.full_name if user else None
     }
 
-    payload = {
-        "trace_id": trace_id,
-        "created_at": created_at,
-        "source": "telegram",
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "user": user_info,
-        "text": text,
-        "intent": classification["intent"],
-        "service": classification["service"],
-        "confidence": classification["confidence"],
-        "summary": classification["summary"],
-        "fields": classification["fields"]
-    }
+    payload = build_payload(
+        trace_id=trace_id,
+        created_at=created_at,
+        chat_id=chat_id,
+        message_id=message_id,
+        user_info=user_info,
+        text=text,
+        classification=classification
+    )
+
+    # Диагностика (временно)
+    print("OUTGOING goal:", repr(payload.get("goal")))
+    print("OUTGOING text:", payload.get("text", "")[:120])
 
     # Отправляем в Make
     try:
